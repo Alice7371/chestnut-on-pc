@@ -1042,16 +1042,13 @@ def reprepare(cap_lin):
                     pi = _dcr(pi, local_size=(ls0[0], ls0[1], Z))
             # k-split serial-K WMMA kernels (WMMA_KSPLIT, 0=off): ridx loop
             # accumulates into register fragments, stores once after the loop.
-            # Whitelist only: the transform assumes the _wm staging shape and
-            # verified K-reduction semantics of these kernels.
-            # MEASURED NET-NEGATIVE (2026-10-07): correct to 1.8e-12 but
-            # r_6_2 flat and r_2_24 16% slower — both kernels sit at the
-            # 255-register occupancy wall (128 live f32 fragments), so the
-            # extra warps only add reduction traffic. Keep off; the lever
-            # there is accumulator storage, not warp count.
-            K = int(os.environ.get('WMMA_KSPLIT', '0') or 0)
-            if K > 1 and kname in ('r_6_2_32_4_2_2_2_4_4_384',
-                                   'r_2_24_32_4_2_2_2_4_4_96'):
+            # Measured 2026-10-08, A/B + frame-validated per kernel:
+            #   r_12_32_4: 1.52->1.32ms, output BIT-IDENTICAL -> ship (default on)
+            #   r_48_32_4: +3% slower, r_6_2 flat, r_2_24 16% slower -> excluded
+            #   (all three sit at/near the 255-register occupancy wall; only
+            #   r_12 at 138 regs has headroom for the extra warps)
+            K = int(os.environ.get('WMMA_KSPLIT', '2') or 0)
+            if K > 1 and kname in ('r_12_32_4_2_2_2_2_4_768',):
                 ptx2 = _ksplit_ptx(ptx, K)
                 if ptx2 is not ptx:
                     ptx = ptx2

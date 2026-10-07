@@ -82,28 +82,30 @@ that mattered:
   slots but stores only its own 3 — 31/32 of phase-1 arithmetic is redundant.
   Exploiting that means changing the data flow (uop level), not the PTX.
 
-## The WMMA attention kernels: why warp-count is a dead end (`_ksplit_ptx`)
+## The WMMA attention kernels: k-split, one win and three rejections (`_ksplit_ptx`)
 
-The two big WMMA kernels (`r_6_2` 29×1.2 ms, `r_2_24` 30×1.0 ms per frame)
-are ALSO serial do-while loops — but K-reductions, not output tiles: the
-loop's stores happen only AFTER it (128 loop-carried f32 mma fragments =
-16 WMMA × 8), so splitting requires a partial-sum exchange. `_ksplit_ptx`
-implements it (tid.z pair scheme, 16 KB chunked shared exchange, `_wm`
-staging slices remapped to the linear warp id) and is numerically correct
-(A/B max diff 1.8e-12, frame plans within 1.1e-3) — **and net-negative**:
-`r_6_2` flat, `r_2_24` 16% slower, frame +5.7 ms.
+The big WMMA kernels (`r_6_2` 29×1.2 ms, `r_2_24` 30×1.0 ms, `r_12_32_4`
+2×1.7 ms, `r_48_32_4` 3×1.0 ms per frame) are ALL serial do-while loops —
+K-reductions, not output tiles: the loop's stores happen only AFTER it
+(loop-carried f32 mma fragments), so splitting requires a partial-sum
+exchange. `_ksplit_ptx` implements it (tid.z pair scheme, chunked shared
+exchange, `_wm` staging slices remapped to the linear warp id). Per-kernel,
+A/B + frame-validated:
 
-The reason is the register file: 128 live f32 fragments put both kernels at
-255 registers/thread, i.e. exactly one 128-thread block per SM. Splitting
-the loop doubles warps per block but cannot add resident blocks, so the
-extra warps only add reduction traffic. The levers that would actually move
-these kernels are accumulator *storage* (keep fragments in shared, drop
-register pressure, raise occupancy) or graph-level split-K with a
-second-pass reduction — both uop/graph surgery, out of scope here. The
-transform stays in the tree (default off, `WMMA_KSPLIT`) with a kernel
-whitelist: the structural anchors alone misfire on lookalike kernels
-(`r_2048_16_24` has the same skeleton but different staging and won't
-compile when remapped).
+| kernel | regs | result |
+| --- | --- | --- |
+| `r_12_32_4` (138 regs) | 1.52→1.32 ms, output **bit-identical**, frame rows bit-identical | **shipped, default on** |
+| `r_48_32_4` (160 regs) | +3% slower | rejected |
+| `r_6_2` (255 regs) | flat | rejected |
+| `r_2_24` (255 regs) | 16% slower | rejected |
+
+The pattern is occupancy: every extra warp must fit the same register file.
+At 255 regs/thread the block count per SM is already 1 and more warps only
+add reduction traffic; at 138 regs there is headroom and the split pays.
+The transform stays available (`WMMA_KSPLIT=2` default) but applies to an
+explicit whitelist — the structural anchors alone misfire on lookalike
+kernels (`r_2048_16_24` has the same skeleton but different staging and
+won't compile when remapped).
 
 War stories from this transform, for the next person:
 
@@ -114,6 +116,11 @@ War stories from this transform, for the next person:
 * A bench harness whose baseline launch dims get mangled produces
   ILLEGAL_ADDRESS that looks exactly like a broken transform — check the
   harness before the kernel (cost: three debug rounds).
+* When A/B-testing a transformed kernel, make sure the BASELINE cubin is
+  the same consumer generation: comparing an mma build against a cached
+  FFMA-era cubin shows maxabs ~1.7 (real consumer divergence) and masks
+  the split's actual effect (bit-identical). Content-hashed caches hold
+  every historical render; grep the PTX, don't trust filenames.
 * `compute-sanitizer` may refuse the device ("not supported") on some
   driver/toolkit combos; the fallback is bisect builds.
 
