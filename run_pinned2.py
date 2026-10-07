@@ -750,7 +750,130 @@ def ptxas_compile(ptx: str) -> bytes:
             raise RuntimeError(f'ptxas failed; PTX saved to {srcf}')
     return open(cub, 'rb').read()
 
-# --- warp-split for the serial single-warp reduce kernel -------------------
+# --- k-split for serial-K WMMA kernels --------------------------------------
+# r_6_2 walks a 384-trip K-reduction loop (loads at ridx k-offsets, mma-accum
+# into 128 loop-carried f32 fragments, single f16 store burst AFTER the loop)
+# on just 4 warps/block. Split the loop across tid.z (Z=2): each z-half does
+# every other k, the z=1 partials go through a 16KB shared buffer, z=0 adds
+# them into its fragments and runs the unchanged epilogue. f32 summation
+# order changes (reassociation-class noise, as everywhere else here).
+# The _wm staging slices (indexed by %tid.y) are remapped to the linear warp
+# id and doubled: with Z=2 the two z-warps of a row run concurrently.
+def _ksplit_ptx(ptx: str, Z: int) -> str:
+    if Z != 2:   # only the z-pair scheme is implemented
+        return ptx
+    lines = ptx.split('\n')
+    try:
+        i_init = next(i for i, l in enumerate(lines) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+        i_step = next(i for i, l in enumerate(lines) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+        i_decl = next(i for i, l in enumerate(lines) if '.shared' in l and '_wm[' in l)
+        i_back = next(i for i, l in enumerate(lines) if 'bra' in l and 'LOOP_ridx_s32_0' in l)
+        i_ret = next(i for i, l in enumerate(lines) if l.strip() == 'ret;')
+    except StopIteration:
+        return ptx
+    if '%tid.z' in ptx:
+        return ptx
+    m = re.search(r'\.reg\s+\.f32\s+%reg_f32_<(\d+)>;', ptx)
+    if not m:
+        return ptx
+    NACC = int(m.group(1))
+    if NACC * 32 * 4 > 16384:   # shared chunk budget
+        return ptx
+    # remap %tid.y -> linear warp id inside _wm contexts, double _wm
+    out = []
+    for l in lines:
+        if '%tid.y' in l and re.search(r'(%wm\w+)\s*,\s*%tid\.y', l):
+            l = l.replace('%tid.y', '%wslid')
+        out.append(l)
+    wm = int(re.search(r'_wm\[(\d+)\]', out[i_decl]).group(1))
+    out[i_decl] = f'\t.shared\t\t.align 4 .b8 _wm[{wm*2}];\n\t.shared\t\t.align 4 .b8 _ksp[16384];'
+    i_init = next(i for i, l in enumerate(out) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+    i_step = next(i for i, l in enumerate(out) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+    out[i_init] = (f'\tmov.u32\t\t%ksz, %tid.z;\n'
+                   f'\tmov.u32\t\t%wslid, %tid.y;\n'
+                   f'\tmad.lo.u32\t%wslid, %ksz, 4, %wslid;\n'
+                   f'\tmov.u32\t\t%ridx_s32_0, %ksz;\n'
+                   f'\tadd.s32\t\t%ridx_s32_0, %ridx_s32_0, -{Z};')
+    out[i_step] = lines[i_step].replace(', 1;', f', {Z};')
+    # shared partial exchange, chunked: [tid.y][tid.x][32] floats per round,
+    # NACC/32 rounds; both warps hit both barriers of every round
+    NC = 32
+    nchunk = (NACC + NC - 1) // NC
+    ins = ['\tmov.u32\t\t%kso, %tid.x;',
+           '\tmov.u32\t\t%wsz, %tid.y;',
+           '\tmad.lo.u32\t%kso, %wsz, 32, %kso;',
+           f'\tmul.lo.u32\t%kso, %kso, {NC*4};',
+           '\tcvt.u64.u32\t%ksp, %kso;',
+           '\tmov.u64\t\t%ksp2, _ksp;',
+           '\tadd.s64\t\t%ksp, %ksp2, %ksp;',
+           '\tsetp.gt.u32\t%kp, %ksz, 0;']
+    for c in range(nchunk):
+        base = c * NC
+        ins += [f'\t@%kp\tst.shared.f32\t[%ksp+{j*4}], %reg_f32_{base+j};' for j in range(NC)]
+        ins.append('\tbar.sync\t\t0;')
+        ins += [f'\t@!%kp\tld.shared.f32\t%kt, [%ksp+{j*4}];\n\t@!%kp\tadd.f32\t\t%reg_f32_{base+j}, %reg_f32_{base+j}, %kt;' for j in range(NC)]
+        ins.append('\tbar.sync\t\t0;')
+    text = '\n'.join(out)
+    text = text.replace(lines[i_back], lines[i_back] + '\n' + '\n'.join(ins) + '\n\t@%kp\tbra\t\tKSKIP;', 1)
+    text = text.replace('\tret;', '\tKSKIP:\n\tret;', 1)
+    text = text.replace('.maxntid 128', '.maxntid 256')
+    i_reg = text.find('\t.reg')
+    text = text[:i_reg] + '\t.reg \t.u32 %wslid;\n\t.reg \t.u32 %wsz;\n\t.reg \t.u32 %ksz;\n\t.reg \t.u32 %kso;\n\t.reg \t.u64 %ksp;\n\t.reg \t.u64 %ksp2;\n\t.reg \t.f32 %kt;\n\t.reg \t.pred %kp;\n' + text[i_reg:]
+    return text
+
+# --- z-split for serial-loop WMMA kernels ----------------------------------
+# r_6_2 / r_2_24 walk a 384-trip do-while loop whose iterations write
+# DISJOINT ridx-addressed output tiles (no cross-iteration accumulation),
+# with only 4 warps per block doing tile work (12 blocks x 128 threads on
+# 48 SMs). Splitting the loop across the UNUSED tid.z dimension gives each
+# tile the identical mma sequence -> outputs stay bit-identical.
+# The _wm shared staging slices are indexed by %tid.y inside %wm* register
+# contexts; remap those to the linear warp id (tid.y + 4*tid.z) and scale
+# the shared declaration accordingly.
+def _zsplit_ptx(ptx: str, Z: int) -> str:
+    if Z <= 1: return ptx
+    lines = ptx.split('\n')
+    try:
+        i_init = next(i for i, l in enumerate(lines) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+        i_step = next(i for i, l in enumerate(lines) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+        i_decl = next(i for i, l in enumerate(lines) if '.shared' in l and '_wm[' in l)
+        i_loop = next(i for i, l in enumerate(lines) if l.strip() == 'LOOP_ridx_s32_0:')
+        i_back = next(i for i, l in enumerate(lines) if 'bra' in l and 'LOOP_ridx_s32_0' in l)
+    except StopIteration:
+        return ptx
+    # safety: iterations must write global outputs inside the loop (disjoint
+    # tiles); a loop whose stores happen only after it accumulates across
+    # iterations cannot be z-split without a reduction
+    if not any('st.global' in l for l in lines[i_loop:i_back]):
+        return ptx
+    if '%tid.z' in ptx:   # tid.z already meaningfully used: unsafe
+        return ptx
+    import re as _re
+    m = _re.search(r'_wm\[(\d+)\]', lines[i_decl])
+    if not m: return ptx
+    warpbytes = int(m.group(1)) // 4   # per-warp slice (rendered for 4 warps)
+    # remap %tid.y -> linear warp id inside _wm register contexts only
+    out = []
+    for i, l in enumerate(lines):
+        if '%tid.y' in l and _re.search(r'(%wm\w+)\s*,\s*%tid\.y', l):
+            l = l.replace('%tid.y', '%wslid')
+        out.append(l)
+    out[i_decl] = f'\t.shared\t\t.align 4 .b8 _wm[{warpbytes*4*Z}];'
+    i_init = next(i for i, l in enumerate(out) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+    i_step = next(i for i, l in enumerate(out) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+    out[i_init] = (f'\tmov.u32\t\t%wsz, %tid.z;\n'
+                   f'\tmov.u32\t\t%wslid, %tid.y;\n'
+                   f'\tmad.lo.u32\t%wslid, %wsz, 4, %wslid;\n'
+                   f'\tmov.u32\t\t%ridx_s32_0, %tid.z;\n'
+                   f'\tadd.s32\t\t%ridx_s32_0, %ridx_s32_0, -{Z};')
+    out[i_step] = lines[i_step].replace(', 1;', f', {Z};')
+    # wslid/wsz register declarations alongside the others
+    i_reg = next(i for i, l in enumerate(out) if l.startswith('\t.reg'))
+    out[i_reg] = ('\t.reg \t.u32 %wslid;\n\t.reg \t.u32 %wsz;\n') + out[i_reg]
+    text = '\n'.join(out).replace('.maxntid 128', f'.maxntid {128*Z}')
+    return text
+
+
 # r_32_32_3_12288_32 loops k=0..12287 step 1 on ONE warp (gs=32x1, ls=32x1):
 # ~8ms of pure serialization. Split the loop across W warps (local y 1->W),
 # each warp strides k by W; partial sums go through shared, warp 0 reduces.
@@ -907,6 +1030,33 @@ def reprepare(cap_lin):
                 if ptx2 is not ptx:
                     ptx = ptx2
                     pi = _dcr(pi, local_size=(32, W, 1))
+            # z-split serial-loop WMMA kernels (WMMA_ZSPLIT, 0=off); the
+            # transform is structural: only fires on _wm kernels with the
+            # ridx do-while and no existing tid.z use
+            Z = int(os.environ.get('WMMA_ZSPLIT', '2') or 0)
+            if Z > 1:
+                ptx2 = _zsplit_ptx(ptx, Z)
+                if ptx2 is not ptx:
+                    ptx = ptx2
+                    ls0 = (list(pi.local_size or (1, 1, 1)) + [1, 1, 1])[:3]
+                    pi = _dcr(pi, local_size=(ls0[0], ls0[1], Z))
+            # k-split serial-K WMMA kernels (WMMA_KSPLIT, 0=off): ridx loop
+            # accumulates into register fragments, stores once after the loop.
+            # Whitelist only: the transform assumes the _wm staging shape and
+            # verified K-reduction semantics of these kernels.
+            # MEASURED NET-NEGATIVE (2026-10-07): correct to 1.8e-12 but
+            # r_6_2 flat and r_2_24 16% slower — both kernels sit at the
+            # 255-register occupancy wall (128 live f32 fragments), so the
+            # extra warps only add reduction traffic. Keep off; the lever
+            # there is accumulator storage, not warp count.
+            K = int(os.environ.get('WMMA_KSPLIT', '0') or 0)
+            if K > 1 and kname in ('r_6_2_32_4_2_2_2_4_4_384',
+                                   'r_2_24_32_4_2_2_2_4_4_96'):
+                ptx2 = _ksplit_ptx(ptx, K)
+                if ptx2 is not ptx:
+                    ptx = ptx2
+                    ls0 = (list(pi.local_size or (1, 1, 1)) + [1, 1, 1])[:3]
+                    pi = _dcr(pi, local_size=(ls0[0], ls0[1], K))
             # reconcile .maxntid with the launch block
             lp = 1
             for d in (pi.local_size or (1, 1, 1)):
