@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+venv*/
+models/*
+!models/README.md
+ptxas_cache/
+*.log
+*.npy
+*.npz
+*.pkl
+*.cubin
+*.ptx
+*.mp4
+*.png
+kd_*.bin
+*.json
+!*.json.example
