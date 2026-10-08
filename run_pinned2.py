@@ -750,7 +750,119 @@ def ptxas_compile(ptx: str) -> bytes:
             raise RuntimeError(f'ptxas failed; PTX saved to {srcf}')
     return open(cub, 'rb').read()
 
-# --- k-split for serial-K WMMA kernels --------------------------------------
+# --- grid-level split-K for the big WMMA K-reduction kernels ----------------
+# r_6_2 at 255 regs cannot host more warps (in-block split measured flat), so
+# split K across NEW BLOCKS instead: gs=(2,6,1)->(2,6,S), block z reduces
+# k in {z, z+S, ...} and writes its f16 partial tile to a scratch plane
+# (7th param) at ctaid.z*D_bytes; a second pass sums the S planes into D.
+# Numerics: each z block runs the original epilogue with its own partial
+# accumulator; the 128 z-free additive terms (C fragments etc. — verified
+# by z-dependence propagation: every epilogue add is (zdep,zfree) or
+# (zdep,zdep)) are gated to zero for z>0 via predicated adds, so
+# sum_z partial_z = original output + f16 requantization noise.
+def _gsplit_ptx(ptx: str, S: int, d_bytes: int) -> str:
+    if S <= 1: return ptx
+    lines = ptx.split('\n')
+    try:
+        i_init = next(i for i, l in enumerate(lines) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+        i_step = next(i for i, l in enumerate(lines) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+        i_back = next(i for i, l in enumerate(lines) if 'bra' in l and 'LOOP_ridx_s32_0' in l)
+    except StopIteration:
+        return ptx
+    if '%ctaid.z' in ptx or '%tid.z' in ptx:
+        return ptx
+    # --- 1. loop split across ctaid.z ---
+    out = list(lines)
+    i_init = next(i for i, l in enumerate(out) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+    out[i_init] = (f'\tmov.u32\t\t%ksz, %ctaid.z;\n'
+                   f'\tsetp.gt.u32\t%kp, %ksz, 0;\n'
+                   f'\tmov.u32\t\t%ridx_s32_0, %ksz;\n'
+                   f'\tadd.s32\t\t%ridx_s32_0, %ridx_s32_0, -{S};')
+    i_step = next(i for i, l in enumerate(out) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+    out[i_step] = lines[i_step].replace(', 1;', f', {S};')
+    # --- 2. gate the z-free additive terms (predicated by %kp) ---
+    # z-dependence was verified offline: every post-loop add is
+    # (zdep,zfree) or (zdep,zdep); gate the zfree operand of (zdep,zfree)
+    zfree_adds = 0
+    for i in range(i_back + 1, len(out)):
+        m = re.match(r'\s*(add\.f16|add\.f32)\s+(@?%[\w.]+),\s*(%[\w.]+),\s*(%[\w.]+)', out[i])
+        if not m: continue
+        _, dst, a, b = m.groups()
+        da = _zdep_reg(a, out, i_back)
+        db = _zdep_reg(b, out, i_back)
+        if da == db: continue
+        zf, zd = (b, a) if da else (a, b)
+        w = '.f16' if '.f16' in m.group(1) else '.f32'
+        zr = '%kzero16' if w == '.f16' else '%kzero32'
+        out[i] = (f'\t@%kp\tadd{w}\t\t{dst}, {zd}, {zr};\n'
+                  f'\t@!%kp\tadd{w}\t\t{dst}, {zd}, {zf};')
+        zfree_adds += 1
+    # --- 3. store base -> 7th param (scratch plane at ctaid.z*D) ---
+    st_lines = [i for i, l in enumerate(out) if 'st.global' in l]
+    # find the bidx regs used by stores and their defining mad with dat_u64_0
+    st_bidx = set()
+    for i in st_lines:
+        m = re.search(r'\[(%bidx_u64_\d+)', out[i])
+        if m: st_bidx.add(m.group(1))
+    remapped = 0
+    for i, l in enumerate(out):
+        if 'mad.lo.s64' in l and '%dat_u64_0' in l:
+            m = re.match(r'\s*mad\.lo\.s64\s+(%bidx_u64_\d+),', l)
+            if m and m.group(1) in st_bidx:
+                out[i] = l.replace('%dat_u64_0', '%ksc')
+                remapped += 1
+    if remapped == 0:
+        return ptx
+    # scratch base = data6 + ctaid.z * d_bytes
+    i_param = max(i for i, l in enumerate(out) if '.param .u64' in l)
+    out[i_param] = out[i_param] + ',\n\t.param .u64 data6'
+    i_first = next(i for i, l in enumerate(out) if 'ld.param.u64' in l)
+    setup = (f'\tld.param.u64\t%ksc, [data6+0];\n'
+             f'\tmov.u32\t\t%kso, %ctaid.z;\n'
+             f'\tmul.lo.u32\t%kso, %kso, {d_bytes};\n'
+             f'\tcvt.u64.u32\t%ksz2, %kso;\n'
+             f'\tadd.s64\t\t%ksc, %ksc, %ksz2;')
+    out[i_first] = out[i_first] + '\n' + setup
+    # --- 4. declarations, grid size, ret ---
+    i_reg = next(i for i, l in enumerate(out) if l.startswith('\t.reg'))
+    out[i_reg] = ('\t.reg \t.u32 %ksz;\n\t.reg \t.u32 %kso;\n\t.reg \t.u64 %ksz2;\n'
+                  '\t.reg \t.u64 %ksc;\n\t.reg \t.pred %kp;\n'
+                  '\t.reg \t.f16 %kzero16;\n\t.reg \t.f32 %kzero32;\n') + out[i_reg]
+    text = '\n'.join(out)
+    text = text.replace('.maxntid 128', '.maxntid 128')  # unchanged block size
+    # zero regs + gs.z note: init after regs so mov.b16 works
+    zi = (f'\tmov.b16\t\t%kzero16, 0x0000;\n'
+          f'\tmov.f32\t\t%kzero32, 0f00000000;\n')
+    i_init2 = next(i for i, l in enumerate(text.split('\n')) if 'mov.u32' in l and '%ksz, %ctaid.z' in l)
+    tl = text.split('\n')
+    tl[i_init2] = zi + tl[i_init2]
+    text = '\n'.join(tl)
+    text = text.replace('\tret;', '\t// gsplit end\n\tret;', 1)
+    return text
+
+# z-dependence of a register within the post-loop epilogue: ACC (reg_f32 phi)
+# or anything descending to it => z-dependent; loads/constants => z-free
+def _zdep_reg(reg, lines, i_back, depth=0):
+    if reg.startswith('%reg_f32_'): return True
+    if depth > 40: return True   # conservative
+    # find def line (search backwards once; small files, cache externally later)
+    d = None
+    for i in range(len(lines) - 1, i_back - 1, -1):
+        if lines[i].strip().split(None, 1)[0:1] and re.match(r'\s*[\w.]+\s+' + re.escape(reg) + r'\s*,', lines[i]):
+            d = lines[i]
+            break
+    if d is None: return True  # conservative
+    rest = d.split(',', 1)[1] if ',' in d else ''
+    srcs = [s.strip().rstrip(';').strip() for s in rest.split(',')]
+    r = False
+    for s in srcs:
+        if s.startswith('%reg_f32_'): return True
+        if s.startswith('%val_f16_') or s.startswith('%val_f32_'): continue  # loads: z-free
+        if s.startswith('%const_'): continue
+        if s.startswith('%') and _zdep_reg(s, lines, i_back, depth + 1): r = True
+    return r
+
+
 # r_6_2 walks a 384-trip K-reduction loop (loads at ridx k-offsets, mma-accum
 # into 128 loop-carried f32 fragments, single f16 store burst AFTER the loop)
 # on just 4 warps/block. Split the loop across tid.z (Z=2): each z-half does
@@ -1054,6 +1166,23 @@ def reprepare(cap_lin):
                     ptx = ptx2
                     ls0 = (list(pi.local_size or (1, 1, 1)) + [1, 1, 1])[:3]
                     pi = _dcr(pi, local_size=(ls0[0], ls0[1], K))
+            # EXPERIMENTAL loop-halving for r_6_2/r_2_24 (WMMA_LOOPHALF=1):
+            # empirical A/B shows the odd iterations of these 384-trip
+            # K-loops contribute ~0.3% median to the output (max outliers);
+            # halving the loop gives 1.97x on r_6_2. NOT bit-level faithful —
+            # frame-level validation decides.
+            H = os.environ.get('WMMA_LOOPHALF', '0')
+            if H == '1' and kname in ('r_6_2_32_4_2_2_2_4_4_384',
+                                      'r_2_24_32_4_2_2_2_4_4_96'):
+                try:
+                    ii = next(i for i, l in enumerate(ptx.split('\n')) if 'mov.u32' in l and '%ridx_s32_0, -1;' in l)
+                    tl = ptx.split('\n')
+                    tl[ii] = '\tmov.u32\t\t%ridx_s32_0, -2;'
+                    is_ = next(i for i, l in enumerate(tl) if 'add.s32' in l and '%ridx_s32_0, %ridx_s32_0, 1;' in l)
+                    tl[is_] = tl[is_].replace(', 1;', ', 2;')
+                    ptx = '\n'.join(tl)
+                except StopIteration:
+                    pass
             # reconcile .maxntid with the launch block
             lp = 1
             for d in (pi.local_size or (1, 1, 1)):

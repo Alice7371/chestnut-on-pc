@@ -136,3 +136,19 @@ War stories from this transform, for the next person:
   validity predicate) instead.
 * Re-linearizing from SINK: loses thread distribution, produces 40 MB /
   850 K-register kernels.
+* **Halving the attention K-loops** (`WMMA_LOOPHALF`, in-tree but default
+  off): single-kernel A/B shows odd iterations contribute only ~0.3% median
+  — but after 90 downstream kernels the frame plans move by up to 2.0
+  (planned speed 1.2 vs 0.5 m/s) — a qualitative behavior change. Rejected
+  at the frame gate. Lesson: element-level "negligible" is not frame-level
+  negligible; always run the frame rows comparison.
+* **Grid-split-K partial planes** (`_gsplit_ptx`, default off): transform
+  compiles and the two planes differ as expected, but the reduced output
+  breaks — the epilogue's z-free additive terms are not all visible as
+  simple `add` sites (phase-2 products fold C in multiplicatively). Needs a
+  full z-dependence proof over the phase-2 DAG before the partial-sum
+  scheme can be correct.
+* Confound to remember: the engine feeds `img = big_img` (the same frame
+  stacked twice), so attention-side content is duplicated by construction.
+  Kernel-level A/Bs on duplicated inputs can show "each half ≈ full" for
+  reasons that are properties of the INPUT, not the kernel.
