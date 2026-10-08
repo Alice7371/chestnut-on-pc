@@ -30,6 +30,67 @@ Speedup layers for the big model:
 4. **Warp-split serial reduce** — `r_32_32_3_12288_32` ran a 12288-iteration
    loop on a *single warp* (6.8 ms); split across 4 warps with a shared-memory
    partial-sum reduce → 2.1 ms (`ALU_SPLIT=4`, default on).
+5. **K-split for `r_12_32_4`** — the attention K-reduction loops resist naive
+   splitting (see NOTES.md for the full case study); `r_12_32_4` has register
+   headroom and takes 1.2× bit-identically (`WMMA_KSPLIT=2`, default on).
+
+## Where the frame time goes (per-kernel case studies)
+
+Profile of one big-model frame (~84 ms on a 2080), and what happened to
+each hotspot:
+
+| kernel | shape found | per-frame | action | result |
+| --- | --- | --- | --- | --- |
+| `r_6_2` (attention GEMM) | 384-trip serial K-loop, 12 blocks = 1 warp/SM, 255 regs | ~25 ms | k-split attempted | **flat** — register-file wall |
+| `r_2_24` (attention) | same shape, 255 regs | ~18 ms | k-split attempted | **+16%** — rejected |
+| `r_12_32_4` | same shape, 138 regs | ~3.3 ms | k-split, partial-sum exchange | **1.2×, bit-identical** |
+| `r_32_32_3` | 12288-trip loop on ONE warp | 6.8 ms | warp-split, shared reduce | **3.15×** |
+| `r_48_32_4` | K-loop, 160 regs | ~2.5 ms | k-split | +3% — rejected |
+
+The lesson: a serial loop is only *cheaply* splittable if the register file
+has room for the extra warps. The 255-register kernels carry their whole
+output tile as live f32 mma fragments across the loop; moving that state
+(shared / graph-level split-K with a scratch buffer + reduction pass) is the
+remaining lever, and the next project.
+
+## Architecture
+
+```
+pickle (comma tinygrad graph, 93 kernels)
+  │  decode: fake QCOM/AMD device stubs → linear uop lists
+  ▼
+reprepare: per-kernel PTX rendering (patched tinygrad PTXRenderer)
+  │  ├─ WMMA emission-time lowering: RDNA4 fragments → shared stage →
+  │  │   mma.m16n8k8 ×4 (or FFMA reference via WMMA_FFMA=1)
+  │  ├─ image2d zero-border: address clamp + validity predicate (PTX level)
+  │  ├─ ALU_SPLIT: warp-split for single-warp serial reduce kernels
+  │  └─ WMMA_KSPLIT: tid.z K-split + chunked shared partial exchange
+  ▼
+offline ptxas → cubin  (content-hashed cache; driver in-process JIT hangs)
+  ▼
+first frame: record the resolved plan (497 launches + copies)
+  ▼
+CUDA graph capture → one cuGraphLaunch per frame  (~1.6 µs/launch)
+  ▼
+run_frame(warped, packed) → plan/lead/lane_lines/hidden_state
+```
+
+## Measurement methodology
+
+* Per-kernel times: `KSYNC=1` inserts an event pair around every launch
+  (e0/launch/e1/synchronize inline — host wall-clock and event-bracketed
+  timings both lie in a deep queue). KSYNC totals include sync overhead;
+  kernel-level deltas are what matter.
+* Single-kernel A/B: probes capture the real runtime buffers at a kernel's
+  first launch (`*_probe.py`), then a fresh-context bench (`bench_*.py`)
+  launches baseline and variant cubins on identical inputs.
+* Frame-level: `video_check.py` writes per-frame plan rows; every shipped
+  change must keep rows bit-identical (exact transforms) or within fp32
+  reassociation noise (k-split transforms).
+* Consumer generation matters: content-hashed caches keep every historical
+  render. An A/B against a stale FFMA-era cubin shows ~1.7 max-abs fake
+  divergence (real mma-vs-FFMA consumer difference) — verify the baseline's
+  PTX before trusting a diff.
 
 ## Quick start
 
@@ -103,6 +164,19 @@ alu_probe.py, alu_opt.py, bench_alu.py   warp-split case study (capture/A-B/benc
 research/           cross-check harness + pickle metadata tools
 models/             put the comma pickles here (not included)
 ```
+
+## Limitations & future work
+
+* The two biggest kernels (`r_6_2`, `r_2_24`, ~45 ms/frame combined) sit at
+  the 255-register occupancy wall: their whole output tile lives as f32 mma
+  fragments across the serial K-loop. In-block splitting cannot add resident
+  blocks. The next lever is graph-level split-K — spread K over new grid
+  blocks, write partials to a scratch buffer, and reduce with a synthesized
+  second kernel (estimated 3-4× on these kernels, i.e. frame → ~45 ms).
+* Windows/WDDM only (CUDA graph behavior is the frame-time foundation).
+* sm_75 assumed for the mma shape; sm_80+ could use `m16n8k16` directly.
+* The engine targets comma's pinned tinygrad tree; pip tinygrad 0.14 breaks
+  the IR.
 
 ## Credits & license
 
